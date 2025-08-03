@@ -1,0 +1,625 @@
+/*
+================================================================================
+                        GUIDE COMPLET SCRIPTS CAPL
+                    Code Global avec Commentaires Détaillés
+================================================================================
+*/
+
+/*
+================================================================================
+1. INCLUSIONS ET DÉFINITIONS
+Objectif: Définir les constantes, inclure les bibliothèques nécessaires
+Utilité: Organisation du code, réutilisabilité, maintenance
+================================================================================
+*/
+#include <stdio.h>          // Inclusion pour les fonctions d'entrée/sortie
+#include <string.h>         // Inclusion pour les fonctions de chaînes
+
+// Définition des constantes pour améliorer la lisibilité
+#define ENGINE_RPM_MAX 6000     // RPM maximum du moteur
+#define ENGINE_RPM_MIN 800      // RPM minimum du moteur
+#define TIMER_INTERVAL_100MS 100 // Intervalle de timer de 100ms
+#define TIMER_INTERVAL_500MS 500 // Intervalle de timer de 500ms
+#define TIMER_INTERVAL_1S 1000   // Intervalle de timer de 1 seconde
+
+// Définition des ID de messages CAN
+#define MSG_ENGINE_DATA 0x100    // ID pour données moteur
+#define MSG_VEHICLE_SPEED 0x200  // ID pour vitesse véhicule
+#define MSG_DIAGNOSTIC 0x300     // ID pour diagnostic
+#define MSG_CYCLIC_TEST 0x400    // ID pour test cyclique
+
+/*
+================================================================================
+2. VARIABLES GLOBALES
+Objectif: Stockage des données persistantes utilisées dans tout le script
+Utilité: Partage de données entre différentes fonctions et événements
+================================================================================
+*/
+variables {
+    // Variables de comptage et de suivi
+    int messageCounter;          // Compteur de messages reçus
+    int errorCounter;           // Compteur d'erreurs détectées
+    int timerCounter;           // Compteur d'événements de timer
+    
+    // Variables de données véhicule
+    int currentRPM;             // RPM actuel du moteur
+    int vehicleSpeed;           // Vitesse actuelle du véhicule
+    float busLoad;              // Charge du bus CAN en pourcentage
+    
+    // Variables de temporisation
+    timer cyclicTimer;          // Timer pour envoi cyclique
+    timer monitoringTimer;      // Timer pour surveillance
+    timer diagnosticTimer;      // Timer pour diagnostic
+    
+    // Variables de fichiers pour journalisation
+    dword logFileHandle;        // Handle du fichier de log
+    dword errorFileHandle;      // Handle du fichier d'erreurs
+    
+    // Variables de configuration
+    byte canBusStatus;          // Statut du bus CAN (0=OK, 1=Error)
+    byte debugMode;             // Mode debug (0=OFF, 1=ON)
+    
+    // Variables de test
+    byte testData[8];           // Tableau pour données de test
+    int testIterations;         // Nombre d'itérations de test
+    
+    // Structure pour message personnalisé
+    struct {
+        int messageId;
+        byte dataLength;
+        byte data[8];
+        dword timestamp;
+    } customMessage;
+}
+
+/*
+================================================================================
+3. DÉCLARATION DES MESSAGES CAN
+Objectif: Définir les messages CAN utilisés dans le script
+Utilité: Structure et organisation des communications CAN
+================================================================================
+*/
+// Messages CAN avec ID spécifiques
+message MSG_ENGINE_DATA engineDataMsg;     // Message données moteur
+message MSG_VEHICLE_SPEED speedMsg;        // Message vitesse
+message MSG_DIAGNOSTIC diagnosticMsg;      // Message diagnostic
+message MSG_CYCLIC_TEST cyclicTestMsg;     // Message test cyclique
+
+/*
+================================================================================
+4. FONCTIONS UTILITAIRES DÉFINIES PAR L'UTILISATEUR
+Objectif: Créer des fonctions réutilisables pour éviter la duplication de code
+Utilité: Modularité, maintenance, réutilisabilité
+================================================================================
+*/
+
+// Fonction d'initialisation des variables
+void initializeVariables() {
+    messageCounter = 0;
+    errorCounter = 0;
+    timerCounter = 0;
+    currentRPM = ENGINE_RPM_MIN;
+    vehicleSpeed = 0;
+    busLoad = 0.0;
+    canBusStatus = 0;
+    debugMode = 1;  // Activer le mode debug par défaut
+    testIterations = 0;
+    
+    // Initialisation du tableau de test
+    int i;
+    for (i = 0; i < 8; i++) {
+        testData[i] = i * 10;
+    }
+    
+    write("Variables initialisées avec succès");
+}
+
+// Fonction pour ouvrir les fichiers de log
+void openLogFiles() {
+    logFileHandle = fopen("capl_messages.log", "w");
+    if (logFileHandle == 0) {
+        write("ERREUR: Impossible d'ouvrir le fichier de log principal");
+    } else {
+        fprintf(logFileHandle, "=== DÉBUT DU LOG CAPL ===\n");
+        write("Fichier de log principal ouvert");
+    }
+    
+    errorFileHandle = fopen("capl_errors.log", "w");
+    if (errorFileHandle == 0) {
+        write("ERREUR: Impossible d'ouvrir le fichier de log d'erreurs");
+    } else {
+        fprintf(errorFileHandle, "=== DÉBUT DU LOG D'ERREURS ===\n");
+        write("Fichier de log d'erreurs ouvert");
+    }
+}
+
+// Fonction pour fermer les fichiers de log
+void closeLogFiles() {
+    if (logFileHandle != 0) {
+        fprintf(logFileHandle, "=== FIN DU LOG CAPL ===\n");
+        fclose(logFileHandle);
+        write("Fichier de log principal fermé");
+    }
+    
+    if (errorFileHandle != 0) {
+        fprintf(errorFileHandle, "=== FIN DU LOG D'ERREURS ===\n");
+        fclose(errorFileHandle);
+        write("Fichier de log d'erreurs fermé");
+    }
+}
+
+// Fonction pour envoyer un message moteur avec RPM spécifique
+void sendEngineMessage(int rpm) {
+    if (rpm < ENGINE_RPM_MIN || rpm > ENGINE_RPM_MAX) {
+        write("ATTENTION: RPM hors limites (%d). Limites: %d-%d", 
+              rpm, ENGINE_RPM_MIN, ENGINE_RPM_MAX);
+        if (errorFileHandle != 0) {
+            fprintf(errorFileHandle, "RPM invalide: %d\n", rpm);
+        }
+        return;
+    }
+    
+    engineDataMsg.dlc = 8;
+    engineDataMsg.byte(0) = (rpm & 0xFF);        // LSB du RPM
+    engineDataMsg.byte(1) = ((rpm >> 8) & 0xFF); // MSB du RPM
+    engineDataMsg.byte(2) = 0x00;                // Réservé
+    engineDataMsg.byte(3) = 0x00;                // Réservé
+    engineDataMsg.byte(4) = canBusStatus;        // Statut du bus
+    engineDataMsg.byte(5) = debugMode;           // Mode debug
+    engineDataMsg.byte(6) = (messageCounter & 0xFF); // Compteur messages
+    engineDataMsg.byte(7) = 0xAA;                // Checksum simple
+    
+    output(engineDataMsg);
+    
+    if (debugMode && logFileHandle != 0) {
+        fprintf(logFileHandle, "Message moteur envoyé - RPM: %d, Compteur: %d\n", 
+                rpm, messageCounter);
+    }
+}
+
+// Fonction pour envoyer un message de vitesse
+void sendSpeedMessage(int speed) {
+    speedMsg.dlc = 4;
+    speedMsg.byte(0) = (speed & 0xFF);
+    speedMsg.byte(1) = ((speed >> 8) & 0xFF);
+    speedMsg.byte(2) = messageCounter;
+    speedMsg.byte(3) = 0xBB; // Checksum
+    
+    output(speedMsg);
+    
+    if (debugMode) {
+        write("Message vitesse envoyé: %d km/h", speed);
+    }
+}
+
+// Fonction de diagnostic du système
+void performDiagnostic() {
+    diagnosticMsg.dlc = 8;
+    diagnosticMsg.byte(0) = messageCounter;
+    diagnosticMsg.byte(1) = errorCounter;
+    diagnosticMsg.byte(2) = canBusStatus;
+    diagnosticMsg.byte(3) = (int)(busLoad * 100) & 0xFF;
+    diagnosticMsg.byte(4) = testIterations;
+    diagnosticMsg.byte(5) = debugMode;
+    diagnosticMsg.byte(6) = 0xCC; // Identificateur diagnostic
+    diagnosticMsg.byte(7) = 0xDD; // Checksum
+    
+    output(diagnosticMsg);
+    
+    write("Diagnostic effectué - Messages: %d, Erreurs: %d, Charge bus: %.2f%%", 
+          messageCounter, errorCounter, busLoad);
+}
+
+// Fonction pour valider les données reçues
+int validateMessage(message msg) {
+    if (msg.dlc == 0) {
+        write("ERREUR: Message avec DLC = 0");
+        errorCounter++;
+        return 0;
+    }
+    
+    if (msg.dlc > 8) {
+        write("ERREUR: DLC invalide (%d > 8)", msg.dlc);
+        errorCounter++;
+        return 0;
+    }
+    
+    return 1; // Message valide
+}
+
+// Fonction pour calculer la moyenne des données
+float calculateAverage(byte data[], int size) {
+    int sum = 0;
+    int i;
+    
+    for (i = 0; i < size; i++) {
+        sum += data[i];
+    }
+    
+    return (float)sum / size;
+}
+
+/*
+================================================================================
+5. ÉVÉNEMENT ON START
+Objectif: Initialisation lors du démarrage du script CAPL
+Utilité: Configuration initiale, ouverture de fichiers, démarrage des timers
+================================================================================
+*/
+on start {
+    write("=====================================");
+    write("    DÉMARRAGE DU SCRIPT CAPL");
+    write("=====================================");
+    
+    // Initialisation des variables
+    initializeVariables();
+    
+    // Ouverture des fichiers de log
+    openLogFiles();
+    
+    // Configuration du message personnalisé
+    customMessage.messageId = 0x999;
+    customMessage.dataLength = 8;
+    customMessage.timestamp = timeNow();
+    
+    // Démarrage des timers
+    setTimer(cyclicTimer, TIMER_INTERVAL_500MS);
+    setTimer(monitoringTimer, TIMER_INTERVAL_1S);
+    setTimer(diagnosticTimer, 5000); // 5 secondes
+    
+    // Message de confirmation
+    write("Script CAPL initialisé avec succès");
+    write("Mode debug: %s", debugMode ? "ACTIVÉ" : "DÉSACTIVÉ");
+    write("Timers démarrés:");
+    write("  - Timer cyclique: %d ms", TIMER_INTERVAL_500MS);
+    write("  - Timer surveillance: %d ms", TIMER_INTERVAL_1S);
+    write("  - Timer diagnostic: 5000 ms");
+    
+    // Premier envoi de message
+    sendEngineMessage(ENGINE_RPM_MIN);
+}
+
+/*
+================================================================================
+6. ÉVÉNEMENTS TIMER
+Objectif: Exécution périodique de fonctions
+Utilité: Envoi cyclique, surveillance, diagnostic automatique
+================================================================================
+*/
+
+// Timer cyclique - Envoi de messages périodiques
+on timer cyclicTimer {
+    timerCounter++;
+    
+    // Simulation d'augmentation progressive du RPM
+    currentRPM += 100;
+    if (currentRPM > ENGINE_RPM_MAX) {
+        currentRPM = ENGINE_RPM_MIN;
+    }
+    
+    // Envoi du message moteur
+    sendEngineMessage(currentRPM);
+    
+    // Simulation de la vitesse basée sur le RPM
+    vehicleSpeed = (currentRPM - ENGINE_RPM_MIN) / 50;
+    sendSpeedMessage(vehicleSpeed);
+    
+    // Log périodique
+    if (debugMode && (timerCounter % 10 == 0)) {
+        write("Timer cyclique #%d - RPM: %d, Vitesse: %d km/h", 
+              timerCounter, currentRPM, vehicleSpeed);
+    }
+    
+    // Redémarrage du timer
+    setTimer(cyclicTimer, TIMER_INTERVAL_500MS);
+}
+
+// Timer de surveillance - Monitoring du système
+on timer monitoringTimer {
+    // Récupération de la charge du bus
+    busLoad = getBusLoad();
+    
+    // Vérification de la charge du bus
+    if (busLoad > 80.0) {
+        write("ATTENTION: Charge du bus élevée (%.2f%%)", busLoad);
+        canBusStatus = 1; // Marquer comme problématique
+        
+        if (errorFileHandle != 0) {
+            fprintf(errorFileHandle, "Charge bus élevée: %.2f%%\n", busLoad);
+        }
+    } else {
+        canBusStatus = 0; // Bus OK
+    }
+    
+    // Affichage des statistiques
+    write("=== SURVEILLANCE SYSTÈME ===");
+    write("Messages traités: %d", messageCounter);
+    write("Erreurs détectées: %d", errorCounter);
+    write("Charge du bus: %.2f%%", busLoad);
+    write("Statut bus: %s", canBusStatus ? "PROBLÈME" : "OK");
+    
+    // Redémarrage du timer
+    setTimer(monitoringTimer, TIMER_INTERVAL_1S);
+}
+
+// Timer de diagnostic - Diagnostic complet du système
+on timer diagnosticTimer {
+    write("=== DIAGNOSTIC AUTOMATIQUE ===");
+    
+    // Exécution du diagnostic
+    performDiagnostic();
+    
+    // Test des données
+    testIterations++;
+    float avgData = calculateAverage(testData, 8);
+    write("Test #%d - Moyenne des données: %.2f", testIterations, avgData);
+    
+    // Redémarrage du timer (diagnostic toutes les 5 secondes)
+    setTimer(diagnosticTimer, 5000);
+}
+
+/*
+================================================================================
+7. ÉVÉNEMENTS DE RÉCEPTION DE MESSAGES
+Objectif: Traitement des messages CAN reçus
+Utilité: Analyse, validation, logging des communications
+================================================================================
+*/
+
+// Réception de messages moteur
+on message MSG_ENGINE_DATA {
+    messageCounter++;
+    
+    // Validation du message
+    if (!validateMessage(this)) {
+        return;
+    }
+    
+    // Extraction des données
+    int receivedRPM = this.byte(0) | (this.byte(1) << 8);
+    byte receivedStatus = this.byte(4);
+    byte receivedCounter = this.byte(6);
+    
+    // Log du message reçu
+    if (debugMode) {
+        write("Message moteur reçu - RPM: %d, Statut: %d, Compteur: %d", 
+              receivedRPM, receivedStatus, receivedCounter);
+    }
+    
+    // Logging dans fichier
+    if (logFileHandle != 0) {
+        fprintf(logFileHandle, "RX ENGINE: ID=0x%X, RPM=%d, Status=%d\n", 
+                this.ID, receivedRPM, receivedStatus);
+    }
+    
+    // Vérification de cohérence
+    if (receivedRPM < ENGINE_RPM_MIN || receivedRPM > ENGINE_RPM_MAX) {
+        write("ERREUR: RPM reçu invalide (%d)", receivedRPM);
+        errorCounter++;
+    }
+}
+
+// Réception de messages de vitesse
+on message MSG_VEHICLE_SPEED {
+    messageCounter++;
+    
+    if (!validateMessage(this)) {
+        return;
+    }
+    
+    int receivedSpeed = this.byte(0) | (this.byte(1) << 8);
+    byte receivedCounter = this.byte(2);
+    
+    if (debugMode) {
+        write("Message vitesse reçu - Vitesse: %d km/h, Compteur: %d", 
+              receivedSpeed, receivedCounter);
+    }
+    
+    // Vérification de vitesse raisonnable
+    if (receivedSpeed > 300) {
+        write("ATTENTION: Vitesse excessive détectée (%d km/h)", receivedSpeed);
+        errorCounter++;
+    }
+}
+
+// Réception de messages de diagnostic
+on message MSG_DIAGNOSTIC {
+    messageCounter++;
+    
+    if (!validateMessage(this)) {
+        return;
+    }
+    
+    write("Message diagnostic reçu:");
+    write("  Messages: %d", this.byte(0));
+    write("  Erreurs: %d", this.byte(1));
+    write("  Statut bus: %d", this.byte(2));
+    write("  Charge bus: %d%%", this.byte(3));
+    write("  Itérations test: %d", this.byte(4));
+}
+
+// Gestionnaire générique pour tous les autres messages
+on message * {
+    // Filtrage des messages non traités spécifiquement
+    if (this.ID != MSG_ENGINE_DATA && 
+        this.ID != MSG_VEHICLE_SPEED && 
+        this.ID != MSG_DIAGNOSTIC) {
+        
+        messageCounter++;
+        
+        if (debugMode) {
+            write("Message générique reçu - ID: 0x%X, DLC: %d", this.ID, this.dlc);
+        }
+        
+        // Traitement par switch-case pour différents ID
+        switch (this.ID) {
+            case 0x500:
+                write("Message système 0x500 traité");
+                break;
+            case 0x600:
+                write("Message configuration 0x600 traité");
+                break;
+            case 0x700:
+                write("Message maintenance 0x700 traité");
+                // Vérification d'un bit spécifique
+                if (this.byte(0) & 0x01) {
+                    write("Bit de maintenance activé");
+                }
+                break;
+            default:
+                if (debugMode) {
+                    write("Message non reconnu - ID: 0x%X", this.ID);
+                }
+        }
+        
+        // Log générique
+        if (logFileHandle != 0) {
+            fprintf(logFileHandle, "RX GENERIC: ID=0x%X, DLC=%d\n", this.ID, this.dlc);
+        }
+    }
+}
+
+/*
+================================================================================
+8. ÉVÉNEMENTS D'ERREUR ET GESTION D'EXCEPTIONS
+Objectif: Gestion des erreurs de communication CAN
+Utilité: Diagnostic, récupération, logging des problèmes
+================================================================================
+*/
+
+// Gestion des trames d'erreur
+on errorFrame {
+    errorCounter++;
+    write("ERREUR: Trame d'erreur détectée - Type: %d", this.errorType);
+    
+    if (errorFileHandle != 0) {
+        fprintf(errorFileHandle, "ERROR FRAME: Type=%d, Time=%d\n", 
+                this.errorType, timeNow());
+    }
+    
+    // Actions correctives selon le type d'erreur
+    switch (this.errorType) {
+        case 1: // Bit Error
+            write("Erreur de bit détectée");
+            break;
+        case 2: // Stuff Error
+            write("Erreur de stuffing détectée");
+            break;
+        case 3: // CRC Error
+            write("Erreur CRC détectée");
+            break;
+        default:
+            write("Type d'erreur inconnu: %d", this.errorType);
+    }
+}
+
+// Gestion de la coupure du bus
+on busOff {
+    errorCounter++;
+    canBusStatus = 1;
+    
+    write("CRITIQUE: Bus CAN hors ligne!");
+    write("Tentative de redémarrage du bus CAN...");
+    
+    if (errorFileHandle != 0) {
+        fprintf(errorFileHandle, "BUS OFF: Time=%d\n", timeNow());
+    }
+    
+    // Tentative de redémarrage
+    restartCAN();
+    
+    // Attendre un moment avant de continuer
+    setTimer(cyclicTimer, TIMER_INTERVAL_1S * 2); // Ralentir temporairement
+}
+
+/*
+================================================================================
+9. ÉVÉNEMENTS CLAVIER (INTERACTION UTILISATEUR)
+Objectif: Permettre l'interaction en temps réel avec le script
+Utilité: Contrôle manuel, tests interactifs, debugging
+================================================================================
+*/
+
+// Activation/désactivation du mode debug
+on key 'D' {
+    debugMode = !debugMode;
+    write("Mode debug %s", debugMode ? "ACTIVÉ" : "DÉSACTIVÉ");
+}
+
+// Envoi manuel d'un message de test
+on key 'T' {
+    write("Envoi manuel d'un message de test");
+    cyclicTestMsg.dlc = 8;
+    cyclicTestMsg.byte(0) = 0xTE;
+    cyclicTestMsg.byte(1) = 0xST;
+    cyclicTestMsg.byte(2) = messageCounter;
+    cyclicTestMsg.byte(3) = errorCounter;
+    cyclicTestMsg.byte(4) = timerCounter;
+    cyclicTestMsg.byte(5) = canBusStatus;
+    cyclicTestMsg.byte(6) = debugMode;
+    cyclicTestMsg.byte(7) = 0xFF;
+    
+    output(cyclicTestMsg);
+    write("Message de test envoyé");
+}
+
+// Reset des compteurs
+on key 'R' {
+    write("Remise à zéro des compteurs");
+    messageCounter = 0;
+    errorCounter = 0;
+    timerCounter = 0;
+    testIterations = 0;
+    write("Compteurs remis à zéro");
+}
+
+// Affichage des statistiques
+on key 'S' {
+    write("===============================");
+    write("     STATISTIQUES SYSTÈME");
+    write("===============================");
+    write("Messages traités: %d", messageCounter);
+    write("Erreurs détectées: %d", errorCounter);
+    write("Événements timer: %d", timerCounter);
+    write("Itérations test: %d", testIterations);
+    write("RPM actuel: %d", currentRPM);
+    write("Vitesse actuelle: %d km/h", vehicleSpeed);
+    write("Charge du bus: %.2f%%", busLoad);
+    write("Statut bus: %s", canBusStatus ? "PROBLÈME" : "OK");
+    write("Mode debug: %s", debugMode ? "ACTIVÉ" : "DÉSACTIVÉ");
+    write("===============================");
+}
+
+/*
+================================================================================
+10. ÉVÉNEMENT ON STOP
+Objectif: Nettoyage lors de l'arrêt du script
+Utilité: Fermeture propre des ressources, sauvegarde finale
+================================================================================
+*/
+on stop {
+    write("=====================================");
+    write("       ARRÊT DU SCRIPT CAPL");
+    write("=====================================");
+    
+    // Affichage des statistiques finales
+    write("STATISTIQUES FINALES:");
+    write("- Messages traités: %d", messageCounter);
+    write("- Erreurs détectées: %d", errorCounter);
+    write("- Événements timer: %d", timerCounter);
+    write("- Itérations test: %d", testIterations);
+    write("- Taux d'erreur: %.2f%%", 
+          messageCounter > 0 ? (float)errorCounter / messageCounter * 100 : 0);
+    
+    // Fermeture des fichiers
+    closeLogFiles();
+    
+    // Message final
+    write("Script CAPL arrêté proprement");
+    write("=====================================");
+}
+
+/*
+
+================================================================================
+*/
